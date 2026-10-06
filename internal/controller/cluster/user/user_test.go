@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +49,7 @@ import (
 const (
 	mechanismSHA256 = "SCRAM-SHA-256"
 	mechanismSHA512 = "SCRAM-SHA-512"
+	credentialsKey  = "credentials"
 )
 
 func TestObserveWrongType(t *testing.T) {
@@ -400,7 +402,7 @@ func TestConnectMalformedCredentials(t *testing.T) {
 						CommonCredentialSelectors: xpv2.CommonCredentialSelectors{
 							SecretRef: &xpv2.SecretKeySelector{
 								SecretReference: xpv2.SecretReference{Name: "creds", Namespace: "default"},
-								Key:             "credentials",
+								Key:             credentialsKey,
 							},
 						},
 					},
@@ -409,11 +411,11 @@ func TestConnectMalformedCredentials(t *testing.T) {
 
 			kube := clientfake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(pc, secret("creds", "default", map[string][]byte{"credentials": tc.creds})).
+				WithObjects(pc, secret("creds", "default", map[string][]byte{credentialsKey: tc.creds})).
 				Build()
 
 			c := &connector{
-				cache: &kafka.ClientCache{},
+				cache: &kafka.ClientCaches{},
 				kube:  kube,
 				usage: resource.NewLegacyProviderConfigUsageTracker(kube, &apisv1alpha1.ProviderConfigUsage{}),
 				newServiceFn: func(_ context.Context, _ []byte, _ client.Client) (*kadm.Client, error) {
@@ -429,5 +431,79 @@ func TestConnectMalformedCredentials(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantBrokers, got.(*external).brokers)
 		})
+	}
+}
+
+// TestConnectCachesClientPerProviderConfig pins the client cache to the
+// ProviderConfig identity: resources referencing different ProviderConfigs
+// (e.g. different Kafka clusters) must each keep their own client, and
+// connecting with one must never close or replace another's client.
+func TestConnectCachesClientPerProviderConfig(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, apis.AddToScheme(scheme))
+
+	pc := func(name string) *apisv1alpha1.ProviderConfig {
+		return &apisv1alpha1.ProviderConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: apisv1alpha1.ProviderConfigSpec{Credentials: apisv1alpha1.ProviderCredentials{
+				Source: xpv2.CredentialsSourceSecret,
+				CommonCredentialSelectors: xpv2.CommonCredentialSelectors{
+					SecretRef: &xpv2.SecretKeySelector{
+						SecretReference: xpv2.SecretReference{Name: name, Namespace: "default"},
+						Key:             credentialsKey,
+					},
+				},
+			}},
+		}
+	}
+	user := func(pcName string) *v1alpha1.User {
+		cr := &v1alpha1.User{
+			TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: v1alpha1.UserKind},
+			ObjectMeta: metav1.ObjectMeta{Name: "alice-" + pcName, UID: "user-uid"},
+		}
+		cr.Spec.ProviderConfigReference = &xpv2.Reference{Name: pcName}
+		return cr
+	}
+
+	kube := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			pc("pc-a"), pc("pc-b"),
+			secret("pc-a", "default", map[string][]byte{credentialsKey: []byte(`{"brokers":["a:9092"]}`)}),
+			secret("pc-b", "default", map[string][]byte{credentialsKey: []byte(`{"brokers":["b:9092"]}`)}),
+		).
+		Build()
+
+	created := map[string][]*kgo.Client{}
+	c := &connector{
+		cache: &kafka.ClientCaches{},
+		kube:  kube,
+		usage: resource.NewLegacyProviderConfigUsageTracker(kube, &apisv1alpha1.ProviderConfigUsage{}),
+		newServiceFn: func(_ context.Context, data []byte, _ client.Client) (*kadm.Client, error) {
+			kcl, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:1"))
+			if err != nil {
+				return nil, err
+			}
+			t.Cleanup(kcl.Close)
+			created[string(data)] = append(created[string(data)], kcl)
+			return kadm.NewClient(kcl), nil
+		},
+	}
+
+	for range 3 {
+		for _, tc := range []struct{ pc, broker string }{{"pc-a", "a:9092"}, {"pc-b", "b:9092"}} {
+			got, err := c.Connect(context.Background(), user(tc.pc))
+			require.NoError(t, err)
+			assert.Equal(t, []string{tc.broker}, got.(*external).brokers)
+		}
+	}
+
+	require.Len(t, created, 2)
+	for data, clients := range created {
+		require.Len(t, clients, 1, "client for %s must be created once and reused", data)
+		assert.NoError(t, clients[0].Context().Err(), "client for %s must not be closed by other identities", data)
 	}
 }
