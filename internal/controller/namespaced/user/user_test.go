@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +49,7 @@ import (
 const (
 	mechanismSHA256 = "SCRAM-SHA-256"
 	mechanismSHA512 = "SCRAM-SHA-512"
+	credentialsKey  = "credentials"
 )
 
 func TestObserveWrongType(t *testing.T) {
@@ -399,7 +401,7 @@ func TestConnectMalformedCredentials(t *testing.T) {
 						CommonCredentialSelectors: xpv2.CommonCredentialSelectors{
 							SecretRef: &xpv2.SecretKeySelector{
 								SecretReference: xpv2.SecretReference{Name: "creds", Namespace: "team-a"},
-								Key:             "credentials",
+								Key:             credentialsKey,
 							},
 						},
 					},
@@ -408,11 +410,11 @@ func TestConnectMalformedCredentials(t *testing.T) {
 
 			kube := clientfake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(pc, secret("creds", "team-a", map[string][]byte{"credentials": tc.creds})).
+				WithObjects(pc, secret("creds", "team-a", map[string][]byte{credentialsKey: tc.creds})).
 				Build()
 
 			c := &connector{
-				cache: &kafka.ClientCache{},
+				cache: &kafka.ClientCaches{},
 				kube:  kube,
 				usage: resource.NewProviderConfigUsageTracker(kube, &apisv1alpha1.ProviderConfigUsage{}),
 				newServiceFn: func(_ context.Context, _ []byte, _ client.Client) (*kadm.Client, error) {
@@ -429,4 +431,117 @@ func TestConnectMalformedCredentials(t *testing.T) {
 			assert.Equal(t, tc.wantBrokers, got.(*external).brokers)
 		})
 	}
+}
+
+// TestConnectCachesClientPerProviderConfig pins the client cache to the full
+// ProviderConfig identity: equally named ProviderConfigs in different
+// namespaces and a ClusterProviderConfig of the same name must each get their
+// own client, connecting with one must never close another's client, and a
+// credential rotation must only replace the rotated identity's client.
+func TestConnectCachesClientPerProviderConfig(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, apis.AddToScheme(scheme))
+
+	creds := func(ns string) xpv2.CommonCredentialSelectors {
+		return xpv2.CommonCredentialSelectors{
+			SecretRef: &xpv2.SecretKeySelector{
+				SecretReference: xpv2.SecretReference{Name: "creds", Namespace: ns},
+				Key:             credentialsKey,
+			},
+		}
+	}
+	pc := func(ns string) *apisv1alpha1.ProviderConfig {
+		return &apisv1alpha1.ProviderConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "pc", Namespace: ns},
+			Spec: apisv1alpha1.ProviderConfigSpec{Credentials: apisv1alpha1.ProviderCredentials{
+				Source: xpv2.CredentialsSourceSecret, CommonCredentialSelectors: creds(ns),
+			}},
+		}
+	}
+	cpc := &apisv1alpha1.ClusterProviderConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "pc"},
+		Spec: apisv1alpha1.ProviderConfigSpec{Credentials: apisv1alpha1.ProviderCredentials{
+			Source: xpv2.CredentialsSourceSecret, CommonCredentialSelectors: creds("crossplane-system"),
+		}},
+	}
+	user := func(ns, kind string) *v1alpha1.User {
+		cr := &v1alpha1.User{
+			TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: v1alpha1.UserKind},
+			ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: ns, UID: "user-uid"},
+		}
+		cr.Spec.ProviderConfigReference = &xpv2.ProviderConfigReference{Name: "pc", Kind: kind}
+		return cr
+	}
+
+	kube := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			pc("team-a"), pc("team-b"), cpc,
+			secret("creds", "team-a", map[string][]byte{credentialsKey: []byte(`{"brokers":["a:9092"]}`)}),
+			secret("creds", "team-b", map[string][]byte{credentialsKey: []byte(`{"brokers":["b:9092"]}`)}),
+			secret("creds", "crossplane-system", map[string][]byte{credentialsKey: []byte(`{"brokers":["c:9092"]}`)}),
+		).
+		Build()
+
+	created := map[string][]*kgo.Client{}
+	c := &connector{
+		cache: &kafka.ClientCaches{},
+		kube:  kube,
+		usage: resource.NewProviderConfigUsageTracker(kube, &apisv1alpha1.ProviderConfigUsage{}),
+		newServiceFn: func(_ context.Context, data []byte, _ client.Client) (*kadm.Client, error) {
+			kcl, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:1"))
+			if err != nil {
+				return nil, err
+			}
+			t.Cleanup(kcl.Close)
+			created[string(data)] = append(created[string(data)], kcl)
+			return kadm.NewClient(kcl), nil
+		},
+	}
+
+	connect := func(cr *v1alpha1.User) []string {
+		t.Helper()
+		got, err := c.Connect(context.Background(), cr)
+		require.NoError(t, err)
+		return got.(*external).brokers
+	}
+	closed := func(kcl *kgo.Client) bool { return kcl.Context().Err() != nil }
+
+	userA := user("team-a", "ProviderConfig")
+	userB := user("team-b", "ProviderConfig")
+	userC := user("team-a", "ClusterProviderConfig")
+
+	// Interleave reconciles across the three identities.
+	for range 3 {
+		assert.Equal(t, []string{"a:9092"}, connect(userA))
+		assert.Equal(t, []string{"b:9092"}, connect(userB))
+		assert.Equal(t, []string{"c:9092"}, connect(userC))
+	}
+
+	require.Len(t, created, 3)
+	for data, clients := range created {
+		require.Len(t, clients, 1, "client for %s must be created once and reused", data)
+		assert.False(t, closed(clients[0]), "client for %s must not be closed by other identities", data)
+	}
+
+	// Rotate team-a credentials: only team-a's client is replaced.
+	s := &corev1.Secret{}
+	require.NoError(t, kube.Get(context.Background(), client.ObjectKey{Name: "creds", Namespace: "team-a"}, s))
+	s.Data[credentialsKey] = []byte(`{"brokers":["a2:9092"]}`)
+	require.NoError(t, kube.Update(context.Background(), s))
+
+	assert.Equal(t, []string{"a2:9092"}, connect(userA))
+	assert.Equal(t, []string{"b:9092"}, connect(userB))
+	assert.Equal(t, []string{"c:9092"}, connect(userC))
+
+	require.Len(t, created, 4)
+	assert.True(t, closed(created[`{"brokers":["a:9092"]}`][0]), "rotated team-a client must be closed")
+	assert.False(t, closed(created[`{"brokers":["a2:9092"]}`][0]))
+	assert.False(t, closed(created[`{"brokers":["b:9092"]}`][0]))
+	assert.False(t, closed(created[`{"brokers":["c:9092"]}`][0]))
+	assert.Len(t, created[`{"brokers":["b:9092"]}`], 1)
+	assert.Len(t, created[`{"brokers":["c:9092"]}`], 1)
 }

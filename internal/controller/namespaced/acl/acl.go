@@ -50,7 +50,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 
 	opts := []managed.ReconcilerOption{
 		managed.WithExternalConnector(&connector{
-			cache:        &kafka.ClientCache{},
+			cache:        &kafka.ClientCaches{},
 			kube:         mgr.GetClient(),
 			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 			newServiceFn: kafka.NewAdminClient,
@@ -104,7 +104,7 @@ func SetupGated(mgr ctrl.Manager, o controller.Options) error {
 
 // A connector is expected to produce an ExternalClient when its Connect method is called.
 type connector struct {
-	cache        *kafka.ClientCache
+	cache        *kafka.ClientCaches
 	kube         client.Client
 	log          logging.Logger
 	newServiceFn func(ctx context.Context, creds []byte, kube client.Client) (*kadm.Client, error)
@@ -127,6 +127,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	var cd apisv1alpha1.ProviderCredentials
+	var key kafka.ClientCacheKey
 
 	// Switch to ModernManaged resource to get ProviderConfigRef
 	m := mg.(resource.ModernManaged)
@@ -139,12 +140,14 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			return nil, fmt.Errorf("%s: %w", common.ErrGetPC, err)
 		}
 		cd = pc.Spec.Credentials
+		key = kafka.ClientCacheKey{Kind: ref.Kind, Namespace: m.GetNamespace(), Name: ref.Name}
 	case "ClusterProviderConfig":
 		cpc := &apisv1alpha1.ClusterProviderConfig{}
 		if err := c.kube.Get(ctx, types.NamespacedName{Name: ref.Name}, cpc); err != nil {
 			return nil, fmt.Errorf("%s: %w", common.ErrGetCPC, err)
 		}
 		cd = cpc.Spec.Credentials
+		key = kafka.ClientCacheKey{Kind: ref.Kind, Name: ref.Name}
 	default:
 		return nil, fmt.Errorf("unsupported provider config kind: %s", ref.Kind)
 	}
@@ -154,7 +157,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, fmt.Errorf("%s: %w", common.ErrGetCreds, err)
 	}
 
-	svc, err := c.cache.GetOrCreate(data, func() (*kadm.Client, error) {
+	svc, err := c.cache.GetOrCreate(key, data, func() (*kadm.Client, error) {
 		return c.newServiceFn(ctx, data, c.kube)
 	})
 	if err != nil {

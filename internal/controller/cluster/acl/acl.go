@@ -50,7 +50,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 
 	opts := []managed.ReconcilerOption{
 		managed.WithExternalConnector(&connector{
-			cache:        &kafka.ClientCache{},
+			cache:        &kafka.ClientCaches{},
 			kube:         mgr.GetClient(),
 			usage:        resource.NewLegacyProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 			newServiceFn: kafka.NewAdminClient,
@@ -104,7 +104,7 @@ func SetupGated(mgr ctrl.Manager, o controller.Options) error {
 
 // A connector is expected to produce an ExternalClient when its Connect method is called.
 type connector struct {
-	cache        *kafka.ClientCache
+	cache        *kafka.ClientCaches
 	kube         client.Client
 	log          logging.Logger
 	newServiceFn func(ctx context.Context, creds []byte, kube client.Client) (*kadm.Client, error)
@@ -140,7 +140,8 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, fmt.Errorf("%s: %w", common.ErrGetCreds, err)
 	}
 
-	svc, err := c.cache.GetOrCreate(data, func() (*kadm.Client, error) {
+	key := kafka.ClientCacheKey{Kind: apisv1alpha1.ProviderConfigKind, Name: cr.GetProviderConfigReference().Name}
+	svc, err := c.cache.GetOrCreate(key, data, func() (*kadm.Client, error) {
 		return c.newServiceFn(ctx, data, c.kube)
 	})
 	if err != nil {
